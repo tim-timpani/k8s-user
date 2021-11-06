@@ -17,19 +17,28 @@ generating kubeconfig files can be tedious.
 ###The Solution
 Automate the process of creating users with limited access.
 
+###Requirements
+Besides the packages in the requirements/setup.py, kubectl
+and openssl command line tools are required and must be in
+the PATH variable.
+
 ###k8s_user.py
 Does the tedious aforementioned work of creating kubeconfig
-files with limited access to the cluster.  If --role is not
-provided, it will create a unique role for the new user that
-only has _list, get, watch_ access to all resources.  Optionally,
-an existing role name can be passed in as an agrument.
+files with limited access to the cluster.  
+
+Uses an existing kubeconfig to perform the following:
+* Create a cluster role that has list/get/watch privileges on all resources
+and api groups. (optionally uses a pre-existing role)
+* Create a cluster user and role binding
+* Create and approve a certificate for the user
+* Create a new kubeconfig for the new user
 
 If a --user is provided, that user will be created otherwise,
 the script will create one using the default value.
 
-The k8s_user script requires an existing kubeconfig file
-with sufficeint rights to create the role/rolebionding and
-to request/authorize a cert request.
+If an existing role or rolebinding by the same name already
+exists, the user will be prompted to replace it or quit. Any
+existing certificates by the same name will be replaced and
+any kubeconfigs previously generated with the old certificate
+will no longer be valid.
 
-A new kubeconfig will be generated using the created user/role
-and authenticating using the new cert.

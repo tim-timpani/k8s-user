@@ -24,14 +24,12 @@ class ClusterRoleRule:
     verbs: list[str]
 
 
+# These rules are not advised for hardened security, just a safeguard.  Normally specific resources
+# for each api group are specified for seriously hardened security to only those resources that are
+# needed. Protect the kubeconfig file generated using these rules.
 DEFAULT_RULES = [
     ClusterRoleRule(groups=["*"], resources=["*"], verbs=["list", "get", "watch"])
 ]
-
-
-# Global variable for subprocess run environment
-sub_env = os.environ.copy()
-
 logger = logging.getLogger(os.path.basename(__file__))
 
 
@@ -53,32 +51,42 @@ class KubeConfig:
 
     @property
     def cluster_name(self) -> str:
+        """cluster name is retrieved from source kubeconfig"""
         return self.config_data['clusters'][self.cluster_index]['name']
 
     @property
     def cluster_server(self) -> str:
+        """server is retrieved from source kubeconfig"""
         return self.config_data['clusters'][self.cluster_index]['cluster']['server']
 
     @property
     def k8s_ca(self) -> str:
+        """k8s ca is retrieved from source kubeconfig"""
         return self.config_data['clusters'][self.cluster_index]['cluster']['certificate-authority-data']
 
     @property
-    def role_name(self):
+    def role_name(self) -> str:
+        """role name is derived from user name unless provided"""
         if self.existing_role is None:
             return f"{self.monitor_user}-role"
         return self.existing_role
 
     @property
-    def role_binding_name(self):
+    def role_binding_name(self) -> str:
+        """
+        role binding name is derived from both user and role which is redundant in some cases
+        but helpful in others
+        """
         return f"{self.monitor_user}-{self.role_name}"
 
     @property
-    def cert_request_name(self):
+    def cert_request_name(self) -> str:
+        """cert request is based from user name"""
         return f"{self.monitor_user}-cr"
 
     @property
     def run_env(self) -> dict:
+        """run environement for kubectl commands"""
         run_env = os.environ.copy()
         run_env["KUBECONFIG"] = self.admin_config_path
         return run_env
@@ -331,6 +339,7 @@ class KubeConfig:
             self.apply_cluster_role()
         self.create_role_binding()
 
+        # Create a temp directory for the cert files
         with tempfile.TemporaryDirectory() as temp_dir:
             cert_file = os.path.join(temp_dir, "monitor.crt")
             cert_key_file = os.path.join(temp_dir, "monitor.key")
