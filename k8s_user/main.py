@@ -237,6 +237,21 @@ class KubeConfig:
         self.apply_dict_to_k8s(cluster_role)
         return self.role_name
 
+    def create_role_binding(self):
+        """Creates a cluster role binding for the user"""
+        logging.info(f"Creating cluster role binding for user {self.monitor_user} to role {self.role_name}")
+        role_binding = {
+            "apiVersion": "rbac.authorization.k8s.io/v1",
+            "kind": "ClusterRoleBinding",
+            "metadata": {
+                "name": self.role_binding_name
+            },
+            "roleRef": {"kind": "ClusterRole", "name": self.role_name},
+            "subjects": [{"kind": "User", "name": self.monitor_user}]
+        }
+        self.apply_dict_to_k8s(role_binding)
+        return self.role_binding_name
+
 # =========== NO CLI COMMANDS ABOVE THIS LINE ================
 
     def generate_csr_cli(self) -> tuple[bytes, str]:
@@ -322,7 +337,7 @@ class KubeConfig:
             fp.flush()
             self.run_kubectl(["apply", "-f", fp.name])
 
-    def create_role_binding(self):
+    def create_role_binding_cli(self):
         """Creates a cluster role binding for the user"""
         logging.info(f"Creating cluster role binding for user {self.monitor_user} to role {self.role_name}")
         self.run_kubectl([
@@ -479,6 +494,58 @@ class KubeConfig:
         :return: None
         """
 
+        rbac_api = client.RbacAuthorizationV1Api(self.k8s_client)
+
+        # Check if role/binding already exists
+        bindings = [b.metadata.name for b in rbac_api.list_cluster_role_binding().items]
+        if self.role_binding_name in bindings:
+            ans = input(f"Cluster role binding '{self.role_binding_name}' already exists, overwrite? (y/N)")
+            if ans not in ("y", "Y"):
+                logger.info("Terminating script by user")
+                return
+            logger.info(f"Deleting clusterrolebinding '{self.role_binding_name}'")
+            rbac_api.delete_cluster_role_binding(name=self.role_binding_name)
+
+        roles = [r.metadata.name for r in rbac_api.list_cluster_role().items]
+        if self.role_name in roles and not self.existing_role:
+            ans = input(f"Cluster role '{self.role_name}' already exists, overwrite? (y/N)")
+            if ans not in ("y", "Y"):
+                logger.info("Terminating script by user")
+                return
+            logger.info(f"Deleting clusterrole '{self.role_name}'")
+            rbac_api.delete_cluster_role(name=self.role_name)
+        elif self.existing_role and self.role_name not in roles:
+            raise RuntimeError(f"Role {self.existing_role} specified but does not exist")
+
+        # Create the monitor role/binding in k8s
+        if self.existing_role is None:
+            self.apply_cluster_role()
+        self.create_role_binding()
+
+        # Create a temp directory for the cert files
+        with tempfile.TemporaryDirectory() as temp_dir:
+            cert_file = os.path.join(temp_dir, "monitor.crt")
+            cert_key_file = os.path.join(temp_dir, "monitor.key")
+
+            # Create the cert request and approve it, saving the cert and key files
+            self.generate_and_approve_cert(
+                cert_file_name=cert_file,
+                key_file_name=cert_key_file
+            )
+
+            self.create_new_kubeconfig(
+                cert_file=cert_file,
+                cert_key_file=cert_key_file,
+                output_file=config_file
+            )
+
+    def generate_monitor_config_cli(self, config_file: str):
+        """
+        Main logic to generate a monitor (readonly) kubeconfig file
+        :param config_file: Path to create the new monitor config file
+        :return: None
+        """
+
         # Check if role/binding already exists
         if self.resource_exists('clusterrolebinding', self.role_binding_name):
             ans = input(f"Cluster role binding '{self.role_binding_name}' already exists, overwrite? (y/N)")
@@ -502,7 +569,7 @@ class KubeConfig:
         # Create the monitor role/binding in k8s
         if self.existing_role is None:
             self.apply_cluster_role()
-        self.create_role_binding()
+        self.create_role_binding_cli()
 
         # Create a temp directory for the cert files
         with tempfile.TemporaryDirectory() as temp_dir:
