@@ -1,5 +1,11 @@
 import argparse
 import base64
+from cryptography import x509
+from cryptography.hazmat.primitives import hashes
+from cryptography.hazmat.backends import default_backend
+from cryptography.hazmat.primitives.asymmetric import rsa
+from cryptography.hazmat.primitives import serialization
+from cryptography.x509.oid import NameOID
 from dataclasses import dataclass
 import logging
 import os
@@ -90,6 +96,56 @@ class KubeConfig:
         run_env = os.environ.copy()
         run_env["KUBECONFIG"] = self.admin_config_path
         return run_env
+
+    def generate_csr(self) -> tuple[bytes, str]:
+
+        private_key = rsa.generate_private_key(
+            public_exponent=65537,
+            key_size=4096,
+            backend=default_backend()
+        )
+        b = x509.CertificateSigningRequestBuilder()
+        req = b.subject_name(x509.Name([
+            x509.NameAttribute(NameOID.COUNTRY_NAME, u"US"),
+            x509.NameAttribute(NameOID.STATE_OR_PROVINCE_NAME, u"NC"),
+            x509.NameAttribute(NameOID.LOCALITY_NAME, u"RTP"),
+            x509.NameAttribute(NameOID.ORGANIZATION_NAME, u"NetApp"),
+            x509.NameAttribute(NameOID.COMMON_NAME, self.monitor_user)
+        ])).sign(private_key, hashes.SHA256(), default_backend())
+
+        cert = req.public_bytes(encoding=serialization.Encoding.PEM)
+
+        pem = private_key.private_bytes(
+            encoding=serialization.Encoding.PEM,
+            format=serialization.PrivateFormat.TraditionalOpenSSL,
+            encryption_algorithm=serialization.NoEncryption()
+        ).decode('utf-8')
+
+        return cert, pem
+
+    def generate_csr_cli(self) -> tuple[bytes, str]:
+        with tempfile.NamedTemporaryFile("wb+") as key_file:
+            logging.info(f"Generating cert request {self.cert_request_name}")
+            cert_command = [
+                "openssl", "req", "-new",
+                "-newkey", "rsa:4096",
+                "-nodes",
+                "-keyout", key_file.name,
+                "-subj", f"/CN={self.monitor_user}/O=readers"
+            ]
+            result = subprocess.run(
+                cert_command,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE
+            )
+            if result.returncode != 0:
+                raise RuntimeError("Failed to create cert request - " + result.stderr.decode("utf-8"))
+            cr = result.stdout
+
+            key_file.seek(0)
+            key = key_file.read()
+
+        return cr, key
 
     def _run_kubectl(self, command_args: list[str]) -> subprocess.CompletedProcess:
         """
@@ -195,21 +251,10 @@ class KubeConfig:
             self.run_kubectl(["delete", "csr", self.cert_request_name])
 
         logging.info(f"Generating cert request {self.cert_request_name}")
-        cert_command = [
-            "openssl", "req", "-new",
-            "-newkey", "rsa:4096",
-            "-nodes",
-            "-keyout", key_file_name,
-            "-subj", f"/CN={self.monitor_user}/O=readers"
-        ]
-        result = subprocess.run(
-            cert_command,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE
-        )
-        if result.returncode != 0:
-            raise RuntimeError("Failed to create cert request - " + result.stderr.decode("utf-8"))
-        cr = result.stdout
+        cr, pem = self.generate_csr()
+
+        with open(key_file_name, "w") as fh:
+            fh.write(pem)
 
         # Apply the cert request to k8s
         cert_request = {
