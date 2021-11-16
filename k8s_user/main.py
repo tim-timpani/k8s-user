@@ -1,5 +1,7 @@
 import argparse
 import base64
+
+import kubernetes.client.exceptions
 from cryptography import x509
 from cryptography.hazmat.primitives import hashes
 from cryptography.hazmat.backends import default_backend
@@ -255,14 +257,19 @@ class KubeConfig:
         :return: tuple of user certificate and user private key
         """
 
-        # Check for existing cert
+        # Check for existing CSR
         certs_api = client.CertificatesV1beta1Api()
-        response = certs_api.read_certificate_signing_request_status(
-            name=self.cert_request_name
-        )
-        if response.status.certificate is not None:
-            logger.warning(f"Deleting existing csr '{self.cert_request_name}'")
-            certs_api.delete_certificate_signing_request(name=self.cert_request_name)
+        try:
+            response = certs_api.read_certificate_signing_request_status(
+                name=self.cert_request_name
+            )
+        except kubernetes.client.exceptions.ApiException as k8s_exception:
+            if k8s_exception.status != 404:
+                raise
+        else:
+            if response.status.certificate is not None:
+                logger.warning(f"Deleting existing csr '{self.cert_request_name}'")
+                certs_api.delete_certificate_signing_request(name=self.cert_request_name)
 
         logging.info(f"Generating cert request {self.cert_request_name}")
         cr, pem = self.generate_csr()
@@ -363,6 +370,10 @@ def main():
 
     # Create the certificate for authentication
     user_cert, user_key = kube_config.create_user_auth_cert()
+
+    # Log cert expiration
+    cert_object = x509.load_pem_x509_certificate(user_cert)
+    logger.info(f"Certificate expires on {cert_object.not_valid_after}")
 
     # Generate the kubeconfig data and write it to the file
     config_data = kube_config.get_config_data(client_cert=user_cert, client_key=user_key)
