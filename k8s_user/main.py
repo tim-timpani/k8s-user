@@ -174,6 +174,69 @@ class KubeConfig:
 
         return signed_cert
 
+    def get_config_data(self, client_cert: bytes, client_key: bytes, config_id: str = ""):
+        if config_id == "":
+            config_id = self.cluster_name
+        with open(self.k8s_client.configuration.ssl_ca_cert, "rb") as fh:
+            ca_data = fh.read()
+        cluster_config = {
+            'apiVersion': 'v1',
+            'clusters': [
+                {
+                    'cluster': {
+                        'certificate-authority-data': base64.b64encode(ca_data).decode('utf-8'),
+                        'server': self.k8s_client.configuration.host
+                    },
+                    'name': config_id
+                }
+            ],
+            'contexts': [
+                {
+                    'context': {
+                        'cluster': self.cluster_name,
+                        'user': self.monitor_user,
+                        'namespace': 'default'
+                    },
+                    'name': config_id
+                }
+            ],
+            'current-context': config_id,
+            'kind': 'Config',
+            'preferences': {},
+            'users': [
+                {
+                    'name': self.monitor_user,
+                    'user': {
+                        'client-certificate-data': base64.b64encode(client_cert).decode('utf-8'),
+                        'client-key-data': base64.b64encode(client_key).decode('utf-8')
+                    }
+                }
+            ]
+        }
+        return cluster_config
+
+    def apply_cluster_role(self, rules: (None, list[ClusterRoleRule]) = None):
+        """Create a cluster role for readonly access"""
+        if rules is None:
+            rules = DEFAULT_RULES
+        logger.info(f"Applying cluster role {self.role_name} to k8s")
+        cluster_role = {
+            "apiVersion": "rbac.authorization.k8s.io/v1",
+            "kind": "ClusterRole",
+            "metadata": {
+                "name": self.role_name
+            },
+            "rules": []
+        }
+        for rule in rules:
+            cluster_role["rules"].append({
+                "apiGroups": rule.groups,
+                "resources": rule.resources,
+                "verbs": rule.verbs
+            })
+        self.apply_dict_to_k8s(cluster_role)
+        return self.role_name
+
 # =========== NO CLI COMMANDS ABOVE THIS LINE ================
 
     def generate_csr_cli(self) -> tuple[bytes, str]:
@@ -259,28 +322,6 @@ class KubeConfig:
             fp.flush()
             self.run_kubectl(["apply", "-f", fp.name])
 
-    def apply_cluster_role(self, rules: (None, list[ClusterRoleRule]) = None):
-        """Create a cluster role for readonly access"""
-        if rules is None:
-            rules = DEFAULT_RULES
-        logger.info(f"Applying cluster role {self.role_name} to k8s")
-        cluster_role = {
-            "apiVersion": "rbac.authorization.k8s.io/v1",
-            "kind": "ClusterRole",
-            "metadata": {
-                "name": self.role_name
-            },
-            "rules": []
-        }
-        for rule in rules:
-            cluster_role["rules"].append({
-                "apiGroups": rule.groups,
-                "resources": rule.resources,
-                "verbs": rule.verbs
-            })
-        self.apply_dict_to_k8s(cluster_role)
-        return self.role_name
-
     def create_role_binding(self):
         """Creates a cluster role binding for the user"""
         logging.info(f"Creating cluster role binding for user {self.monitor_user} to role {self.role_name}")
@@ -342,6 +383,27 @@ class KubeConfig:
             fp.write(user_cert)
 
     def create_new_kubeconfig(self, cert_file: str, cert_key_file: str, output_file: str):
+        """
+        Creates the new monitor kubeconfig file
+        :param cert_file: path to existing monitor user cert
+        :param cert_key_file: path to existing key for user cert
+        :param output_file: path to new kubeconfig file to be created
+        :return: None
+        """
+
+        logger.info(f"Creating new kubeconfig file {output_file}")
+
+        with open(cert_file, "rb") as fh:
+            cert = fh.read()
+
+        with open(cert_key_file, "rb") as fh:
+            key = fh.read()
+
+        config_data = self.get_config_data(client_cert=cert, client_key=key)
+        with open(output_file, "w") as fh:
+            yaml.safe_dump(config_data, fh)
+
+    def create_new_kubeconfig_cli(self, cert_file: str, cert_key_file: str, output_file: str):
         """
         Creates the new monitor kubeconfig file
         :param cert_file: path to existing monitor user cert
