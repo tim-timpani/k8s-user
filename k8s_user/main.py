@@ -11,8 +11,6 @@ from datetime import datetime, timezone, timedelta
 from kubernetes import client, config, utils
 import logging
 import os
-from pprint import pprint
-import subprocess
 import time
 import tempfile
 import yaml
@@ -252,100 +250,6 @@ class KubeConfig:
         self.apply_dict_to_k8s(role_binding)
         return self.role_binding_name
 
-# =========== NO CLI COMMANDS ABOVE THIS LINE ================
-
-    def generate_csr_cli(self) -> tuple[bytes, str]:
-        with tempfile.NamedTemporaryFile("wb+") as key_file:
-            logging.info(f"Generating cert request {self.cert_request_name}")
-            cert_command = [
-                "openssl", "req", "-new",
-                "-newkey", "rsa:4096",
-                "-nodes",
-                "-keyout", key_file.name,
-                "-subj", f"/CN={self.monitor_user}/O=readers"
-            ]
-            result = subprocess.run(
-                cert_command,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE
-            )
-            if result.returncode != 0:
-                raise RuntimeError("Failed to create cert request - " + result.stderr.decode("utf-8"))
-            cr = result.stdout
-
-            key_file.seek(0)
-            key = key_file.read()
-
-        return cr, key
-
-    def _run_kubectl(self, command_args: list[str]) -> subprocess.CompletedProcess:
-        """
-        Internal kubectl command method
-        :param command_args: args to pass to kubectl
-        :return: CompletedProcess object
-        """
-        cmd = [KUBECTL_CMD]
-        cmd.extend(command_args)
-        return subprocess.run(
-            cmd,
-            env=self.run_env,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE
-        )
-
-    def run_kubectl(self, command_args: list[str]) -> str:
-        """
-        Run a kubectl command and return stdout
-        :param command_args: list of args to pass to kubectl
-        :return: str containing stdout
-        """
-        result = self._run_kubectl(command_args)
-        if result.returncode != 0:
-            raise RuntimeError(f"Failed to run kubectl args={command_args}"
-                               f" - {result.stderr.decode('utf-8')}")
-        return result.stdout.decode('utf-8')
-
-    def resource_exists(self, resource_type: str, resource_name: str, namespace: (None, str) = None):
-        """
-        Check if a k8s resource exists
-        :param resource_type: resource type
-        :param resource_name: resource name
-        :param namespace: namespace (if namespaced resource)
-        :return: bool True if resource exists, false otherwise
-        """
-        command_args = ["get", resource_type, resource_name]
-        if namespace is not None:
-            command_args.extend(["-n", namespace])
-        result = self._run_kubectl(command_args)
-        if result.returncode != 0:
-            error = result.stderr.decode('utf-8')
-            if "NotFound" in error:
-                return False
-            raise RuntimeError(f"Failed to execute command with args {command_args}")
-        return True
-
-    def apply_dict_to_k8s_cli(self, resource_data: dict):
-        """
-        Apply config to k8s using a dictionary
-        :param resource_data: dict containing apiVersion and appropriate schema
-        :return:
-        """
-        with tempfile.NamedTemporaryFile("w") as fp:
-            kind = resource_data.get('kind', "unknown")
-            logger.info(f"Writing resource data for '{kind}' to temp file {fp.name}")
-            yaml.safe_dump(resource_data, fp)
-            fp.flush()
-            self.run_kubectl(["apply", "-f", fp.name])
-
-    def create_role_binding_cli(self):
-        """Creates a cluster role binding for the user"""
-        logging.info(f"Creating cluster role binding for user {self.monitor_user} to role {self.role_name}")
-        self.run_kubectl([
-            "create", "clusterrolebinding", self.role_binding_name,
-            "--clusterrole", self.role_name,
-            "--user", self.monitor_user
-        ])
-
     def generate_and_approve_cert(self, cert_file_name: str, key_file_name: str):
         """
         Create a certificate for k8s authentication
@@ -355,9 +259,13 @@ class KubeConfig:
         """
 
         # Check for existing cert
-        if self.resource_exists('csr', self.cert_request_name):
+        certs_api = client.CertificatesV1beta1Api()
+        response = certs_api.read_certificate_signing_request_status(
+            name=self.cert_request_name
+        )
+        if response.status.certificate is not None:
             logger.warning(f"Deleting existing csr '{self.cert_request_name}'")
-            self.run_kubectl(["delete", "csr", self.cert_request_name])
+            certs_api.delete_certificate_signing_request(name=self.cert_request_name)
 
         logging.info(f"Generating cert request {self.cert_request_name}")
         cr, pem = self.generate_csr()
@@ -377,9 +285,6 @@ class KubeConfig:
             }
         }
         self.apply_dict_to_k8s(cert_request)
-
-        # Not sure I really need to do this, but nice to fail here if something failed
-        self.verify_cert_request()
 
         # Approve the certificate
         logging.info(f"Approving cert request {self.cert_request_name}")
@@ -418,75 +323,6 @@ class KubeConfig:
         with open(output_file, "w") as fh:
             yaml.safe_dump(config_data, fh)
 
-    def create_new_kubeconfig_cli(self, cert_file: str, cert_key_file: str, output_file: str):
-        """
-        Creates the new monitor kubeconfig file
-        :param cert_file: path to existing monitor user cert
-        :param cert_key_file: path to existing key for user cert
-        :param output_file: path to new kubeconfig file to be created
-        :return: None
-        """
-
-        logger.info(f"Creating new kubeconfig file {output_file}")
-
-        # Save the k8s CA cert from the source config file and create the initial kubeconfig
-        with tempfile.NamedTemporaryFile("wb") as ca_file_pointer:
-            ca_file_pointer.write(base64.b64decode(self.k8s_ca))
-            ca_file_pointer.flush()
-
-            self.run_kubectl([
-                "config",
-                "set-cluster", self.cluster_name,
-                "--server", self.cluster_server,
-                "--certificate-authority", ca_file_pointer.name,
-                "--kubeconfig", output_file,
-                "--embed-certs"
-            ])
-
-        # Add the client certificate data and key
-        self.run_kubectl([
-            "config",
-            "set-credentials", self.monitor_user,
-            "--client-certificate", cert_file,
-            "--client-key", cert_key_file,
-            "--kubeconfig", output_file,
-            "--embed-certs"
-        ])
-
-        # Set the default context
-        context_name = f"{self.cluster_name}-{self.monitor_user}"
-        self.run_kubectl([
-            "config",
-            "set-context", context_name,
-            "--cluster", self.cluster_name,
-            "--namespace", "default",
-            "--user", self.monitor_user,
-            "--kubeconfig", output_file
-        ])
-
-        # Select the default context
-        self.run_kubectl([
-            "config",
-            "use-context", context_name,
-            "--kubeconfig", output_file
-        ])
-
-    def verify_cert_request(self):
-        """
-        Verifies a cert request exists
-        :return:
-        """
-        output = self.run_kubectl([
-            "get",
-            "certificatesigningrequests.certificates.k8s.io",
-            "-o", "yaml"
-        ])
-        certs = yaml.safe_load(output)["items"]
-        for cert in certs:
-            if cert["metadata"]["name"] == self.cert_request_name:
-                return
-        raise RuntimeError(f"cert request {self.cert_request_name} not found")
-
     def generate_monitor_config(self, config_file: str):
         """
         Main logic to generate a monitor (readonly) kubeconfig file
@@ -521,55 +357,6 @@ class KubeConfig:
         if self.existing_role is None:
             self.apply_cluster_role()
         self.create_role_binding()
-
-        # Create a temp directory for the cert files
-        with tempfile.TemporaryDirectory() as temp_dir:
-            cert_file = os.path.join(temp_dir, "monitor.crt")
-            cert_key_file = os.path.join(temp_dir, "monitor.key")
-
-            # Create the cert request and approve it, saving the cert and key files
-            self.generate_and_approve_cert(
-                cert_file_name=cert_file,
-                key_file_name=cert_key_file
-            )
-
-            self.create_new_kubeconfig(
-                cert_file=cert_file,
-                cert_key_file=cert_key_file,
-                output_file=config_file
-            )
-
-    def generate_monitor_config_cli(self, config_file: str):
-        """
-        Main logic to generate a monitor (readonly) kubeconfig file
-        :param config_file: Path to create the new monitor config file
-        :return: None
-        """
-
-        # Check if role/binding already exists
-        if self.resource_exists('clusterrolebinding', self.role_binding_name):
-            ans = input(f"Cluster role binding '{self.role_binding_name}' already exists, overwrite? (y/N)")
-            if ans not in ("y", "Y"):
-                logger.info("Terminating script by user")
-                return
-            logger.info(f"Deleting clusterrolebinding '{self.role_binding_name}'")
-            self.run_kubectl(["delete", "clusterrolebinding", self.role_binding_name])
-
-        role_exists = self.resource_exists('clusterrole', self.role_name)
-        if role_exists and not self.existing_role:
-            ans = input(f"Cluster role '{self.role_name}' already exists, overwrite? (y/N)")
-            if ans not in ("y", "Y"):
-                logger.info("Terminating script by user")
-                return
-            logger.info(f"Deleting clusterrole '{self.role_name}'")
-            self.run_kubectl(["delete", "clusterrole", self.role_name])
-        elif self.existing_role and not role_exists:
-            raise RuntimeError(f"Role {self.existing_role} specified but does not exist")
-
-        # Create the monitor role/binding in k8s
-        if self.existing_role is None:
-            self.apply_cluster_role()
-        self.create_role_binding_cli()
 
         # Create a temp directory for the cert files
         with tempfile.TemporaryDirectory() as temp_dir:
