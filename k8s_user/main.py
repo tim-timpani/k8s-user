@@ -7,10 +7,13 @@ from cryptography.hazmat.primitives.asymmetric import rsa
 from cryptography.hazmat.primitives import serialization
 from cryptography.x509.oid import NameOID
 from dataclasses import dataclass
+from datetime import datetime, timezone, timedelta
 from kubernetes import client, config, utils
 import logging
 import os
+from pprint import pprint
 import subprocess
+import time
 import tempfile
 import yaml
 
@@ -128,6 +131,51 @@ class KubeConfig:
 
         return cert, pem
 
+    def apply_dict_to_k8s(self, resource_data: dict):
+        utils.create_from_dict(
+            k8s_client=self.k8s_client,
+            data=resource_data
+        )
+
+    def approve_k8s_csr(self) -> bytes:
+
+        certs_api = client.CertificatesV1beta1Api()
+
+        # Get the CSR
+        body = certs_api.read_certificate_signing_request_status(self.cert_request_name)
+
+        # create an approval condition
+        approval_condition = client.V1beta1CertificateSigningRequestCondition(
+            last_update_time=datetime.now(timezone.utc).astimezone(),
+            message='This certificate was approved by Python Client API',
+            reason='MyOwnReason',
+            type='Approved')
+
+        # patch the existing `body` with the new conditions
+        # you might want to append the new conditions to the existing ones
+        body.status.conditions = [approval_condition]
+
+        # patch the Kubernetes object
+        response = certs_api.replace_certificate_signing_request_approval(
+            self.cert_request_name,
+            body
+        )
+
+        start_timer = datetime.now()
+        while response.status.certificate is None:
+            time.sleep(5)
+            if datetime.now() - start_timer > timedelta(seconds=300):
+                raise TimeoutError("Timeout waiting for certificate")
+            response = certs_api.read_certificate_signing_request_status(
+                name=self.cert_request_name
+            )
+
+        signed_cert = base64.b64decode(response.status.certificate)
+
+        return signed_cert
+
+# =========== NO CLI COMMANDS ABOVE THIS LINE ================
+
     def generate_csr_cli(self) -> tuple[bytes, str]:
         with tempfile.NamedTemporaryFile("wb+") as key_file:
             logging.info(f"Generating cert request {self.cert_request_name}")
@@ -197,12 +245,6 @@ class KubeConfig:
                 return False
             raise RuntimeError(f"Failed to execute command with args {command_args}")
         return True
-
-    def apply_dict_to_k8s(self, resource_data: dict):
-        utils.create_from_dict(
-            k8s_client=self.k8s_client,
-            data=resource_data
-        )
 
     def apply_dict_to_k8s_cli(self, resource_data: dict):
         """
@@ -285,14 +327,19 @@ class KubeConfig:
 
         # Approve the certificate
         logging.info(f"Approving cert request {self.cert_request_name}")
-        self.run_kubectl(["certificate", "approve", self.cert_request_name])
+        # self.run_kubectl(["certificate", "approve", self.cert_request_name])
 
         # Get the signed cert and save it to file
-        result = self.run_kubectl(["get", "csr", self.cert_request_name, "-o", "yaml"])
-        cert_data = yaml.safe_load(result)
-        user_cert = cert_data["status"]["certificate"]
+        # result = self.run_kubectl(["get", "csr", self.cert_request_name, "-o", "yaml"])
+        # cert_data = yaml.safe_load(result)
+
+        # user_cert = cert_data["status"]["certificate"]
+
+        user_cert = self.approve_k8s_csr()
+
         with open(cert_file_name, "wb") as fp:
-            fp.write(base64.b64decode(user_cert))
+            # fp.write(base64.b64decode(user_cert))
+            fp.write(user_cert)
 
     def create_new_kubeconfig(self, cert_file: str, cert_key_file: str, output_file: str):
         """

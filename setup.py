@@ -14,8 +14,8 @@ setup(
     description='Kubernetes Script to create users/kubeconfigs',
     install_requires=[
         'pyyaml',
-        'cryptography',
-        'kubernetes'
+        'cryptography>=35.0.0',
+        'kubernetes>=19.15.0'
     ],
     entry_points={
         'console_scripts': [
