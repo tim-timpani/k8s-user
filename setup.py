@@ -2,7 +2,7 @@ from setuptools import setup, find_packages
 
 setup(
     name='k8s_user',
-    version='1.0.0',
+    version='2.0.0',
     packages=find_packages(include=[
         'k8s_user', 'k8s_user.*'
     ]),

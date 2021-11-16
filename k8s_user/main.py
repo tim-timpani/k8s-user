@@ -12,7 +12,6 @@ from kubernetes import client, config, utils
 import logging
 import os
 import time
-import tempfile
 import yaml
 
 DEF_KUBECONFIG = os.getenv("KUBECONFIG", os.path.expanduser("~/.kube/config"))
@@ -103,7 +102,7 @@ class KubeConfig:
         run_env["KUBECONFIG"] = self.admin_config_path
         return run_env
 
-    def generate_csr(self) -> tuple[bytes, str]:
+    def generate_csr(self) -> tuple[bytes, bytes]:
 
         private_key = rsa.generate_private_key(
             public_exponent=65537,
@@ -125,7 +124,7 @@ class KubeConfig:
             encoding=serialization.Encoding.PEM,
             format=serialization.PrivateFormat.TraditionalOpenSSL,
             encryption_algorithm=serialization.NoEncryption()
-        ).decode('utf-8')
+        )
 
         return cert, pem
 
@@ -250,12 +249,10 @@ class KubeConfig:
         self.apply_dict_to_k8s(role_binding)
         return self.role_binding_name
 
-    def generate_and_approve_cert(self, cert_file_name: str, key_file_name: str):
+    def create_user_auth_cert(self) -> tuple[bytes, bytes]:
         """
         Create a certificate for k8s authentication
-        :param cert_file_name: Path where the cert file will be saved
-        :param key_file_name: Path where the private key will be saved
-        :return:
+        :return: tuple of user certificate and user private key
         """
 
         # Check for existing cert
@@ -269,9 +266,6 @@ class KubeConfig:
 
         logging.info(f"Generating cert request {self.cert_request_name}")
         cr, pem = self.generate_csr()
-
-        with open(key_file_name, "w") as fh:
-            fh.write(pem)
 
         # Apply the cert request to k8s
         cert_request = {
@@ -288,45 +282,13 @@ class KubeConfig:
 
         # Approve the certificate
         logging.info(f"Approving cert request {self.cert_request_name}")
-        # self.run_kubectl(["certificate", "approve", self.cert_request_name])
-
-        # Get the signed cert and save it to file
-        # result = self.run_kubectl(["get", "csr", self.cert_request_name, "-o", "yaml"])
-        # cert_data = yaml.safe_load(result)
-
-        # user_cert = cert_data["status"]["certificate"]
-
         user_cert = self.approve_k8s_csr()
 
-        with open(cert_file_name, "wb") as fp:
-            # fp.write(base64.b64decode(user_cert))
-            fp.write(user_cert)
+        return user_cert, pem
 
-    def create_new_kubeconfig(self, cert_file: str, cert_key_file: str, output_file: str):
+    def create_monitor_user_role(self):
         """
-        Creates the new monitor kubeconfig file
-        :param cert_file: path to existing monitor user cert
-        :param cert_key_file: path to existing key for user cert
-        :param output_file: path to new kubeconfig file to be created
-        :return: None
-        """
-
-        logger.info(f"Creating new kubeconfig file {output_file}")
-
-        with open(cert_file, "rb") as fh:
-            cert = fh.read()
-
-        with open(cert_key_file, "rb") as fh:
-            key = fh.read()
-
-        config_data = self.get_config_data(client_cert=cert, client_key=key)
-        with open(output_file, "w") as fh:
-            yaml.safe_dump(config_data, fh)
-
-    def generate_monitor_config(self, config_file: str):
-        """
-        Main logic to generate a monitor (readonly) kubeconfig file
-        :param config_file: Path to create the new monitor config file
+        Creates cluster role and role binding for the user
         :return: None
         """
 
@@ -358,23 +320,6 @@ class KubeConfig:
             self.apply_cluster_role()
         self.create_role_binding()
 
-        # Create a temp directory for the cert files
-        with tempfile.TemporaryDirectory() as temp_dir:
-            cert_file = os.path.join(temp_dir, "monitor.crt")
-            cert_key_file = os.path.join(temp_dir, "monitor.key")
-
-            # Create the cert request and approve it, saving the cert and key files
-            self.generate_and_approve_cert(
-                cert_file_name=cert_file,
-                key_file_name=cert_key_file
-            )
-
-            self.create_new_kubeconfig(
-                cert_file=cert_file,
-                cert_key_file=cert_key_file,
-                output_file=config_file
-            )
-
 
 def get_args():
     """Get the command line arguments"""
@@ -402,14 +347,27 @@ def get_args():
 
 
 def main():
+
     args = get_args()
     logging.basicConfig(level=logging.INFO)
+
+    # Create a kubeconfig object
     kube_config = KubeConfig(
         admin_config_path=os.path.expanduser(args.kubeconfig),
         monitor_user=args.user,
         existing_role=args.role
     )
-    kube_config.generate_monitor_config(args.outfile)
+
+    # Create the cluster role and role binding
+    kube_config.create_monitor_user_role()
+
+    # Create the certificate for authentication
+    user_cert, user_key = kube_config.create_user_auth_cert()
+
+    # Generate the kubeconfig data and write it to the file
+    config_data = kube_config.get_config_data(client_cert=user_cert, client_key=user_key)
+    with open(args.outfile, "w") as fh:
+        yaml.safe_dump(config_data, fh)
 
 
 if __name__ == "__main__":
