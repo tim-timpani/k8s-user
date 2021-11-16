@@ -7,6 +7,7 @@ from cryptography.hazmat.primitives.asymmetric import rsa
 from cryptography.hazmat.primitives import serialization
 from cryptography.x509.oid import NameOID
 from dataclasses import dataclass
+from kubernetes import client, config, utils
 import logging
 import os
 import subprocess
@@ -41,11 +42,15 @@ logger = logging.getLogger(os.path.basename(__file__))
 
 class KubeConfig:
 
-    def __init__(self, admin_config_path: str, monitor_user: str = CLUSTER_USER, existing_role: (None, str) = None):
+    def __init__(self, admin_config_path: str, monitor_user: str = CLUSTER_USER,
+                 existing_role: (None, str) = None, context: (None, str) = None):
 
         self.admin_config_path = admin_config_path
         self.monitor_user = monitor_user
         self.existing_role = existing_role
+
+        config.load_kube_config(config_file=admin_config_path, context=context)
+        self.k8s_client = client.ApiClient()
 
         with open(admin_config_path, "r") as fh:
             self.config_data = yaml.safe_load(fh)
@@ -194,6 +199,12 @@ class KubeConfig:
         return True
 
     def apply_dict_to_k8s(self, resource_data: dict):
+        utils.create_from_dict(
+            k8s_client=self.k8s_client,
+            data=resource_data
+        )
+
+    def apply_dict_to_k8s_cli(self, resource_data: dict):
         """
         Apply config to k8s using a dictionary
         :param resource_data: dict containing apiVersion and appropriate schema
@@ -263,7 +274,7 @@ class KubeConfig:
             "metadata": {"name": self.cert_request_name},
             "spec": {
                 "signerName": "kubernetes.io/kube-apiserver-client",
-                "request": base64.b64encode(cr),
+                "request": base64.b64encode(cr).decode('utf-8'),
                 "usages": ["client auth"]
             }
         }

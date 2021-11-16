@@ -13,7 +13,9 @@ setup(
     author_email='timothy.martin@netapp.com',
     description='Kubernetes Script to create users/kubeconfigs',
     install_requires=[
-        'pyyaml'
+        'pyyaml',
+        'cryptography',
+        'kubernetes'
     ],
     entry_points={
         'console_scripts': [
